@@ -27,7 +27,10 @@ docker compose up --build --exit-code-from verify --abort-on-container-exit veri
 2. **应用构建**：字节码编译 + ASGI 应用导入检查
 3. **业务冒烟请求**：提交一份同时包含**阈值交点**（6→10°C 穿越 8°C 阈值）
    和**覆盖缺口**（00:25→00:45 间隔 1200s > 600s 上限）的请求，断言裁决结果；
-   并验证乱序 + 不同十进制/时区表示的请求得到完全相同的结论。
+   并验证乱序 + 不同十进制/时区表示的请求得到完全相同的结论。随后再提交一份
+   **分阶段温限**请求（00:20 阈值由 8°C 切换为 9°C，同时含阈值切换、按各阶段
+   阈值求交点和覆盖缺口），断言合并后的连续区间、度分钟总量与乱序不变性，
+   以及阶段未相邻时的可定位 422。
 
 ## API
 
@@ -52,10 +55,37 @@ docker compose up --build --exit-code-from verify --abort-on-container-exit veri
 | --- | --- |
 | `transport_start` / `transport_end` | 运输起止时刻（RFC3339） |
 | `threshold_celsius` | 温度阈值（°C），严格高于才算暴露 |
+| `threshold_periods` | 可选，分阶段温限；与 `threshold_celsius` 二选一。1–16 个 `{start, end, threshold_celsius}`，阶段须首尾覆盖运输全程、彼此相邻且不重叠，**输入次序不影响结果** |
 | `max_interval_seconds` | 最大采样间隔（>0）；相邻读数间隔超过它即形成覆盖缺口 |
 | `max_single_excursion_seconds` | 单次超温时长上限（≥0） |
 | `degree_minute_budget` | 度分钟预算（≥0） |
 | `readings` | 2–500 条 `{time, celsius}`，时刻（按绝对时刻）唯一；首末读数须恰好位于运输边界 |
+
+### 分阶段温限（`threshold_periods`）
+
+装载、平衡与稳定运输等阶段可采用不同温限。阶段区间为半开 `[start, end)`，
+**边界时刻起新阶段阈值生效**。服务会在每个阶段边界处精确切分有效采样段
+（边界处温度仍沿原线性轨迹插值），并分别按各阶段阈值：
+
+- 精确求解阈值交点，累计**严格超温**时长与度分钟（逐段梯形/三角形积分）；
+- 边界两侧均严格超温时保持为**同一次**超温区间（不重复计时、不漏计）；
+  任一侧不超温则在边界处结束或开启区间；
+- 不跨越覆盖缺口插值或计时，缺口两侧的超温区间始终分开。
+
+```json
+"threshold_periods": [
+  {"start": "2026-01-01T00:00:00Z",
+   "end": "2026-01-01T00:20:00Z",
+   "threshold_celsius": 8.0},
+  {"start": "2026-01-01T00:20:00Z",
+   "end": "2026-01-01T00:55:00Z",
+   "threshold_celsius": 9.0}
+]
+```
+
+省略 `threshold_periods` 时使用单一 `threshold_celsius`，响应内容与错误语义
+完全保持兼容。非法阶段时刻、阈值非有限（`NaN` / `Infinity`）、阶段重叠、
+存在覆盖缺口或未恰好覆盖运输全程均返回可定位的 422（`loc` 指向具体阶段）。
 
 ### 裁决规则
 
@@ -64,7 +94,8 @@ docker compose up --build --exit-code-from verify --abort-on-container-exit veri
   交点；**等于阈值不计暴露**。
 - 间隔超过上限形成**覆盖缺口**：不跨越缺口插值，缺口会中断进行中的超温区间。
 - 暴露区间内对（温度 − 阈值）积分得到度分钟（梯形/三角形精确面积）。
-- 在共享读数处相邻的暴露段合并为同一超温区间。
+- 在共享读数处相邻的暴露段合并为同一超温区间；分阶段时在阶段边界两侧均
+  严格超温的暴露段同样合并为同一区间。
 
 ### 成功响应（200）
 
@@ -115,7 +146,7 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python -m verify.run
 
 ```
 app/timeutil.py   RFC3339 精确解析（→ Fraction 纪元秒）与格式化
-app/core.py       暴露裁决引擎（线性插值、阈值交点、度分钟、缺口）
+app/core.py       暴露裁决引擎（线性插值、分阶段阈值、阈值交点、度分钟、缺口）
 app/main.py       FastAPI 入口、请求校验（可定位 422）、裁决与响应组装
 tests/            pytest 单元与 API 测试
 verify/run.py     一次性验证：测试 + 构建 + 冒烟请求，退出码报告结果

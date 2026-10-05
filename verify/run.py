@@ -83,6 +83,30 @@ def representation_variant(payload: dict) -> dict:
     return variant
 
 
+def phased_payload() -> dict:
+    """Same trajectory as smoke_payload() but with per-phase limits:
+
+    phase 1 (loading) limit 8 degC until 00:20, phase 2 (steady transport)
+    limit 9 degC from 00:20.  The request therefore contains a threshold
+    switch, crossings solved against both limits, and the same coverage gap.
+    """
+    payload = smoke_payload()
+    del payload["threshold_celsius"]
+    payload["threshold_periods"] = [
+        {
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-01T00:20:00Z",
+            "threshold_celsius": 8.0,
+        },
+        {
+            "start": "2026-01-01T00:20:00Z",
+            "end": "2026-01-01T00:55:00Z",
+            "threshold_celsius": 9.0,
+        },
+    ]
+    return payload
+
+
 def wait_for_api(timeout_s: int = 90) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -182,6 +206,67 @@ def main() -> int:
                 and r3.json()["detail"][0]["loc"] == ["body", "readings", 1, "time"]
             )
             check("duplicate timestamp -> locatable 422", loc_ok, f"got {r3.status_code}: {r3.text[:300]}")
+
+            # per-phase limits: one request containing a threshold switch
+            # (8 -> 9 degC at 00:20), crossings under both limits and the
+            # coverage gap; pieces merge at the switch because both sides are
+            # strictly above their phase limit (300 + 1200 + 37.5 deg-sec).
+            rp = requests.post(
+                API_BASE + "/api/cold-chain/exposure", json=phased_payload(), timeout=10
+            )
+            check("phased status 200", rp.status_code == 200, f"got {rp.status_code}: {rp.text[:400]}")
+            pbody = rp.json()
+            pcodes = {reason["code"] for reason in pbody.get("reasons", [])}
+            check(
+                "phased reasons cover gap + single-excursion",
+                {"coverage_gap", "single_excursion_exceeded"} <= pcodes,
+                f"codes={pcodes}",
+            )
+            check(
+                "phased excursion 00:05:00-00:21:15, 975s, 25.625 deg-min",
+                pbody.get("excursions")
+                == [
+                    {
+                        "start": "2026-01-01T00:05:00Z",
+                        "end": "2026-01-01T00:21:15Z",
+                        "duration_seconds": "975",
+                        "degree_minutes": "25.625",
+                    }
+                ],
+                json.dumps(pbody.get("excursions")),
+            )
+            check(
+                "phased total degree-minutes 25.625",
+                pbody.get("total_degree_minutes") == "25.625",
+                str(pbody.get("total_degree_minutes")),
+            )
+
+            # phase periods given in reverse input order -> identical result
+            rev = phased_payload()
+            rev["threshold_periods"] = list(reversed(rev["threshold_periods"]))
+            rpr = requests.post(API_BASE + "/api/cold-chain/exposure", json=rev, timeout=10)
+            check(
+                "phased period order invariant",
+                rpr.status_code == 200 and rpr.json() == pbody,
+                f"status={rpr.status_code} body={rpr.text[:400]}",
+            )
+
+            # a phase period that leaves the transport uncovered -> locatable 422
+            bad_periods = phased_payload()
+            bad_periods["threshold_periods"][1]["start"] = "2026-01-01T00:21:00Z"
+            r4 = requests.post(
+                API_BASE + "/api/cold-chain/exposure", json=bad_periods, timeout=10
+            )
+            period_loc_ok = (
+                r4.status_code == 422
+                and r4.json()["detail"][0]["loc"]
+                == ["body", "threshold_periods", 1, "start"]
+            )
+            check(
+                "non-adjacent threshold periods -> locatable 422",
+                period_loc_ok,
+                f"got {r4.status_code}: {r4.text[:300]}",
+            )
         except requests.RequestException as exc:
             check("smoke request executed", False, str(exc))
 
