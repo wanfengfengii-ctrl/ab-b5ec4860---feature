@@ -29,6 +29,8 @@ app = FastAPI(title="Cold-Chain Exposure Service", version="1.0.0")
 
 MIN_READINGS = 2
 MAX_READINGS = 500
+MIN_THRESHOLD_PERIODS = 1
+MAX_THRESHOLD_PERIODS = 16
 MAX_ERRORS = 50
 
 
@@ -263,8 +265,115 @@ async def cold_chain_exposure(request: Request) -> JSONResponse:
     if errors:
         raise Unprocessable(errors)
 
+    # ---- threshold_periods (optional, ordered-invariant) ------------------
+    # Each item: {"start": RFC3339, "end": RFC3339, "threshold_celsius": num}.
+    # When present the 1..16 periods must be adjacent, non-overlapping and
+    # cover [transport_start, transport_end] exactly.  At a shared boundary
+    # the NEW period's threshold is in effect.  Input order is irrelevant:
+    # periods are sorted before use, and every cross-period error is reported
+    # at the offending entry's ORIGINAL index.
+    threshold_periods = None
+    periods_raw = data.get("threshold_periods")
+    if periods_raw is not None:
+        if not isinstance(periods_raw, list):
+            errors.append(
+                _err(["threshold_periods"], "expected an array of threshold periods",
+                     "type_error.list")
+            )
+        elif not (MIN_THRESHOLD_PERIODS <= len(periods_raw) <= MAX_THRESHOLD_PERIODS):
+            errors.append(
+                _err(
+                    ["threshold_periods"],
+                    f"must contain between {MIN_THRESHOLD_PERIODS} and "
+                    f"{MAX_THRESHOLD_PERIODS} periods, got {len(periods_raw)}",
+                    "value_error.list.length",
+                )
+            )
+        else:
+            parsed_periods: list = []  # (input_index, start, end, threshold)
+            for i, item in enumerate(periods_raw):
+                loc = ["threshold_periods", i]
+                if not isinstance(item, dict):
+                    errors.append(
+                        _err(loc, "expected an object with 'start', 'end' and "
+                             "'threshold_celsius'", "type_error.object")
+                    )
+                    continue
+                for key in ("start", "end", "threshold_celsius"):
+                    if key not in item:
+                        errors.append(_err([*loc, key], "field required",
+                                           "value_error.missing"))
+                pt = pe = pv = None
+                if "start" in item:
+                    pt = _as_timestamp(item["start"], [*loc, "start"], errors)
+                if "end" in item:
+                    pe = _as_timestamp(item["end"], [*loc, "end"], errors)
+                if "threshold_celsius" in item:
+                    pv = _as_finite_number(
+                        item["threshold_celsius"], [*loc, "threshold_celsius"], errors
+                    )
+                if pt is not None and pe is not None and pv is not None:
+                    if pt >= pe:
+                        errors.append(
+                            _err([*loc, "end"],
+                                 "period end must be later than period start",
+                                 "value_error.datetime.ordering")
+                        )
+                    else:
+                        parsed_periods.append((i, pt, pe, pv))
+
+        if not errors and parsed_periods:
+            ordered = sorted(parsed_periods, key=lambda x: x[1])
+            idx0, p0_start, _, _ = ordered[0]
+            idxN, _, pN_end, _ = ordered[-1]
+            if p0_start != start:
+                errors.append(
+                    _err(
+                        ["threshold_periods", idx0, "start"],
+                        "first period must start at transport_start "
+                        f"({fraction_to_rfc3339(start)})",
+                        "value_error.boundary",
+                    )
+                )
+            if pN_end != end:
+                errors.append(
+                    _err(
+                        ["threshold_periods", idxN, "end"],
+                        "last period must end at transport_end "
+                        f"({fraction_to_rfc3339(end)})",
+                        "value_error.boundary",
+                    )
+                )
+            for (ia, _, ea, _va), (ib, sb, _, _vb) in zip(ordered, ordered[1:]):
+                if ea > sb:
+                    errors.append(
+                        _err(
+                            ["threshold_periods", ib, "start"],
+                            f"period[{ib}] overlaps period[{ia}]: its start "
+                            f"{fraction_to_rfc3339(sb)} precedes the previous "
+                            f"period end {fraction_to_rfc3339(ea)}",
+                            "value_error.overlap",
+                        )
+                    )
+                elif ea < sb:
+                    errors.append(
+                        _err(
+                            ["threshold_periods", ib, "start"],
+                            f"coverage hole between periods: period[{ia}] ends at "
+                            f"{fraction_to_rfc3339(ea)} but period[{ib}] starts at "
+                            f"{fraction_to_rfc3339(sb)}; periods must be adjacent "
+                            "and cover the whole transport",
+                            "value_error.coverage",
+                        )
+                    )
+            if not errors:
+                threshold_periods = [(s, e, v) for _, s, e, v in ordered]
+
+        if errors:
+            raise Unprocessable(errors)
+
     # ---- adjudication -----------------------------------------------------
-    result = compute_exposure(points, threshold, max_interval)
+    result = compute_exposure(points, threshold, max_interval, threshold_periods)
 
     reasons: list = []
     for i, gap in enumerate(result.gaps):

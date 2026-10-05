@@ -171,6 +171,163 @@ def test_interval_exactly_at_max_is_not_a_gap():
 
 
 # --------------------------------------------------------------------------
+# core engine: per-period thresholds
+# --------------------------------------------------------------------------
+def _periods(spec):
+    """spec: list of (start, end, threshold) already in Fractions."""
+    return list(spec)
+
+
+def test_periods_single_period_matches_constant_threshold():
+    points = [(Fraction(0), Fraction(6)), (Fraction(600), Fraction(10))]
+    single = compute_exposure(points, Fraction(8), Fraction(600))
+    staged = compute_exposure(
+        points, Fraction(99), Fraction(600), [(Fraction(0), Fraction(600), Fraction(8))]
+    )
+    assert [(e.start, e.end, e.degree_seconds) for e in staged.excursions] == [
+        (e.start, e.end, e.degree_seconds) for e in single.excursions
+    ]
+    assert staged.total_degree_seconds == single.total_degree_seconds
+    assert staged.gaps == single.gaps
+
+
+def test_periods_threshold_switch_changes_exposure():
+    # Constant temperature 9 degC. Threshold 10 in period 1 (no exposure),
+    # threshold 8 in period 2 (exposure): the excursion opens exactly at the
+    # boundary where the new threshold takes effect.
+    points = [
+        (Fraction(0), Fraction(9)),
+        (Fraction(300), Fraction(9)),
+        (Fraction(600), Fraction(9)),
+    ]
+    res = compute_exposure(
+        points,
+        Fraction(8),
+        Fraction(600),
+        [
+            (Fraction(0), Fraction(300), Fraction(10)),
+            (Fraction(300), Fraction(600), Fraction(8)),
+        ],
+    )
+    assert not res.gaps
+    assert [(e.start, e.end) for e in res.excursions] == [(300, 600)]
+    # (9 - 8) degC over 300 s = 300 degree-seconds
+    assert res.excursions[0].degree_seconds == 300
+
+
+def test_periods_excursion_closes_when_new_threshold_not_exceeded():
+    # 9 degC everywhere: above threshold 8 on both sides of t=300, but the
+    # new period's threshold is 9 -> strictly above is false at/after the
+    # boundary, so the excursion ends at 300.
+    points = [
+        (Fraction(0), Fraction(9)),
+        (Fraction(300), Fraction(9)),
+        (Fraction(600), Fraction(9)),
+    ]
+    res = compute_exposure(
+        points,
+        Fraction(8),
+        Fraction(600),
+        [
+            (Fraction(0), Fraction(300), Fraction(8)),
+            (Fraction(300), Fraction(600), Fraction(9)),
+        ],
+    )
+    assert [(e.start, e.end) for e in res.excursions] == [(0, 300)]
+    assert res.excursions[0].degree_seconds == 300  # 1 degC * 300 s
+
+
+def test_periods_strictly_above_both_sides_keeps_one_excursion():
+    # Temperature 9 at the boundary; thresholds 8 -> 8.5, both exceeded:
+    # one continuous excursion even though the applicable threshold jumps.
+    points = [
+        (Fraction(0), Fraction(9)),
+        (Fraction(300), Fraction(9)),
+        (Fraction(600), Fraction(9)),
+    ]
+    res = compute_exposure(
+        points,
+        Fraction(8),
+        Fraction(600),
+        [
+            (Fraction(0), Fraction(300), Fraction(8)),
+            (Fraction(300), Fraction(600), Fraction(Fraction(17, 2))),
+        ],
+    )
+    assert len(res.excursions) == 1
+    assert (res.excursions[0].start, res.excursions[0].end) == (0, 600)
+    # (9-8)*300 + (9-8.5)*300 = 300 + 150 degree-seconds, no double counting
+    assert res.excursions[0].degree_seconds == 450
+
+
+def test_periods_crossing_solved_within_split_segment():
+    # One sampling segment [0, 600], temperature linear 6 -> 12; threshold
+    # switches 8 -> 11 at t=300 (temperature there is exactly 9).
+    # Period 1: exposed where v>8 -> from t=200 (v=8) to 300.
+    # Period 2: exposed where v>11 -> from t=500 (v=11) to 600.
+    # Two separate excursions; each piece integrated against its own
+    # threshold.
+    points = [(Fraction(0), Fraction(6)), (Fraction(600), Fraction(12))]
+    res = compute_exposure(
+        points,
+        Fraction(8),
+        Fraction(600),
+        [
+            (Fraction(0), Fraction(300), Fraction(8)),
+            (Fraction(300), Fraction(600), Fraction(11)),
+        ],
+    )
+    assert [(e.start, e.end) for e in res.excursions] == [(200, 300), (500, 600)]
+    # piece 1 triangle: excess 0..(9-8)=1 over 100 s -> 50 deg*s
+    assert res.excursions[0].degree_seconds == 50
+    # piece 2 triangle: excess 0..(12-11)=1 over 100 s -> 50 deg*s
+    assert res.excursions[1].degree_seconds == 50
+    assert res.total_degree_seconds == 100
+
+
+def test_periods_gap_not_counted_across():
+    # A coverage gap [600,1800] straddles the period boundary at 1200:
+    # no exposure across it, and excursions on either side stay separate.
+    points = [
+        (Fraction(0), Fraction(10)),
+        (Fraction(600), Fraction(10)),
+        (Fraction(1800), Fraction(10)),
+        (Fraction(2400), Fraction(10)),
+    ]
+    res = compute_exposure(
+        points,
+        Fraction(8),
+        Fraction(600),
+        [
+            (Fraction(0), Fraction(1200), Fraction(8)),
+            (Fraction(1200), Fraction(2400), Fraction(9)),
+        ],
+    )
+    assert [g.duration_seconds for g in res.gaps] == [1200]
+    assert [(e.start, e.end) for e in res.excursions] == [(0, 600), (1800, 2400)]
+    # second excursion against the stricter 9 degC threshold: 1 degC * 600 s
+    assert res.excursions[1].degree_seconds == 600
+
+
+def test_periods_input_order_does_not_matter():
+    points = [
+        (Fraction(0), Fraction(9)),
+        (Fraction(300), Fraction(9)),
+        (Fraction(600), Fraction(9)),
+    ]
+    periods_a = [
+        (Fraction(0), Fraction(300), Fraction(10)),
+        (Fraction(300), Fraction(600), Fraction(8)),
+    ]
+    periods_b = list(reversed(periods_a))
+    ra = compute_exposure(points, Fraction(8), Fraction(600), periods_a)
+    rb = compute_exposure(points, Fraction(8), Fraction(600), periods_b)
+    assert [(e.start, e.end, e.degree_seconds) for e in ra.excursions] == [
+        (e.start, e.end, e.degree_seconds) for e in rb.excursions
+    ]
+
+
+# --------------------------------------------------------------------------
 # API
 # --------------------------------------------------------------------------
 def smoke_payload():
@@ -372,6 +529,304 @@ def test_api_too_many_readings_422():
     r = client.post("/api/cold-chain/exposure", json=payload)
     assert r.status_code == 422
     assert r.json()["detail"][0]["loc"] == ["body", "readings"]
+
+
+# --------------------------------------------------------------------------
+# API: per-period thresholds (threshold_periods)
+# --------------------------------------------------------------------------
+def staged_smoke_payload():
+    """Switch + crossing + coverage gap in one trajectory.
+
+    Timeline (all readings every 600s except 00:25->00:45 = 1200s gap):
+      00:00 v=6   00:10 v=10  00:20 v=10  00:25 v=6
+      [gap 1200s]
+      00:45 v=7   00:55 v=7
+    Periods: loading 00:00-00:30 threshold 8, transport 00:30-00:55 threshold 6.
+    """
+    p = smoke_payload()
+    p["max_single_excursion_seconds"] = 3600
+    p["degree_minute_budget"] = 30
+    p["threshold_periods"] = [
+        {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:30:00Z",
+         "threshold_celsius": 8.0},
+        {"start": "2026-01-01T00:30:00Z", "end": "2026-01-01T00:55:00Z",
+         "threshold_celsius": 6.0},
+    ]
+    return p
+
+
+def test_api_periods_switch_crossing_and_gap():
+    # Period 1 (threshold 8): exposed 00:05:00 -> 00:22:30 (crossing 6->10
+    # up, 10->6 down), 27.5 degree-minutes.
+    # Gap 00:25 -> 00:45.
+    # Period 2 (threshold 6): 00:45 v=7 -> 00:55 v=7, entire segment exposed,
+    # (7-6) * 600 / 60 = 10 degree-minutes.  Separate excursion (gap breaks).
+    r = client.post("/api/cold-chain/exposure", json=staged_smoke_payload())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["verdict"] == "fail"
+    assert body["coverage_gaps"] == [
+        {
+            "start": "2026-01-01T00:25:00Z",
+            "end": "2026-01-01T00:45:00Z",
+            "duration_seconds": "1200",
+        }
+    ]
+    assert body["excursions"] == [
+        {
+            "start": "2026-01-01T00:05:00Z",
+            "end": "2026-01-01T00:22:30Z",
+            "duration_seconds": "1050",
+            "degree_minutes": "27.5",
+        },
+        {
+            "start": "2026-01-01T00:45:00Z",
+            "end": "2026-01-01T00:55:00Z",
+            "duration_seconds": "600",
+            "degree_minutes": "10",
+        },
+    ]
+    # 27.5 + 10 = 37.5 > 30 budget: stricter second period tips the verdict
+    assert body["total_degree_minutes"] == "37.5"
+    codes = [reason["code"] for reason in body["reasons"]]
+    assert codes == ["coverage_gap", "degree_minute_budget_exceeded"]
+
+
+def test_api_periods_same_trajectory_other_thresholds_pass():
+    # The identical trajectory with a looser second-period threshold (8):
+    # period 2 contributes nothing, total stays 27.5 <= 30 -> only the gap
+    # fails.  Shows the conclusion changes with the per-period limits.
+    p = staged_smoke_payload()
+    p["threshold_periods"][1]["threshold_celsius"] = 8.0
+    body = client.post("/api/cold-chain/exposure", json=p).json()
+    assert body["total_degree_minutes"] == "27.5"
+    assert [e["end"] for e in body["excursions"]] == ["2026-01-01T00:22:30Z"]
+    codes = [reason["code"] for reason in body["reasons"]]
+    assert codes == ["coverage_gap"]
+
+
+def test_api_periods_boundary_threshold_new_period_in_effect():
+    # Reading exactly at the boundary equals the NEW period's threshold:
+    # not exposed there, excursion ends at the boundary (no overlap/double
+    # timing). 9 -> 9 -> 9 constant; thresholds 8 then 9.
+    p = smoke_payload()
+    p["max_interval_seconds"] = 3600
+    p["readings"] = [
+        {"time": "2026-01-01T00:00:00Z", "celsius": 9.0},
+        {"time": "2026-01-01T00:30:00Z", "celsius": 9.0},
+        {"time": "2026-01-01T00:55:00Z", "celsius": 9.0},
+    ]
+    p["threshold_periods"] = [
+        {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:30:00Z",
+         "threshold_celsius": 8.0},
+        {"start": "2026-01-01T00:30:00Z", "end": "2026-01-01T00:55:00Z",
+         "threshold_celsius": 9.0},
+    ]
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["excursions"] == [
+        {
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-01T00:30:00Z",
+            "duration_seconds": "1800",
+            "degree_minutes": "30",  # (9-8)*1800/60
+        }
+    ]
+    assert body["total_degree_minutes"] == "30"
+
+
+def test_api_periods_order_invariant():
+    p1 = staged_smoke_payload()
+    p2 = staged_smoke_payload()
+    p2["threshold_periods"] = list(reversed(p2["threshold_periods"]))
+    r1 = client.post("/api/cold-chain/exposure", json=p1)
+    r2 = client.post("/api/cold-chain/exposure", json=p2)
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json() == r2.json()
+
+
+def test_api_periods_not_an_array_422():
+    p = staged_smoke_payload()
+    p["threshold_periods"] = {"start": "2026-01-01T00:00:00Z"}
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == ["body", "threshold_periods"]
+
+
+def test_api_periods_count_bounds_422():
+    p = staged_smoke_payload()
+    p["threshold_periods"] = []
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    detail = r.json()["detail"][0]
+    assert detail["loc"] == ["body", "threshold_periods"]
+    assert "1 and 16" in detail["msg"]
+
+    p = staged_smoke_payload()
+    p["threshold_periods"] = [
+        {
+            "start": f"2026-01-01T00:{i:02d}:00Z" if i < 56 else "2026-01-01T00:55:00Z",
+            "end": (
+                f"2026-01-01T00:{i + 1:02d}:00Z"
+                if i + 1 < 56
+                else "2026-01-01T00:55:00Z"
+            ),
+            "threshold_celsius": 8.0,
+        }
+        for i in range(17)
+    ]
+    # The fabricated instants need not be valid; the count error is raised
+    # before per-item validation, so just assert the locatable failure.
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == ["body", "threshold_periods"]
+
+
+def test_api_periods_missing_inner_field_422():
+    p = staged_smoke_payload()
+    del p["threshold_periods"][1]["threshold_celsius"]
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == [
+        "body", "threshold_periods", 1, "threshold_celsius"
+    ]
+
+
+def test_api_periods_bad_timestamp_422():
+    p = staged_smoke_payload()
+    p["threshold_periods"][0]["end"] = "not-a-time"
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == [
+        "body", "threshold_periods", 0, "end"
+    ]
+
+
+def test_api_periods_non_finite_threshold_422():
+    p = staged_smoke_payload()
+    raw = json.dumps(p).replace(
+        '"threshold_celsius": 6.0', '"threshold_celsius": Infinity', 1
+    )
+    # Replace only within threshold_periods (the second period carries 6.0).
+    r = client.post(
+        "/api/cold-chain/exposure",
+        content=raw.encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert any(
+        d["loc"] == ["body", "threshold_periods", 1, "threshold_celsius"]
+        and "finite" in d["msg"]
+        for d in detail
+    ), detail
+
+
+def test_api_periods_reversed_single_period_422():
+    p = staged_smoke_payload()
+    p["threshold_periods"][1]["start"] = "2026-01-01T00:55:00Z"
+    p["threshold_periods"][1]["end"] = "2026-01-01T00:30:00Z"
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == [
+        "body", "threshold_periods", 1, "end"
+    ]
+
+
+def test_api_periods_does_not_cover_start_422():
+    p = staged_smoke_payload()
+    p["threshold_periods"][0]["start"] = "2026-01-01T00:01:00Z"
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    detail = r.json()["detail"][0]
+    # Error reported at the earliest period in absolute order; carries the
+    # ORIGINAL index even when inputs arrive shuffled.
+    assert detail["loc"][:2] == ["body", "threshold_periods"]
+    assert "transport_start" in detail["msg"]
+
+
+def test_api_periods_overlap_422():
+    p = staged_smoke_payload()
+    p["threshold_periods"][1]["start"] = "2026-01-01T00:29:00Z"  # overlaps
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    detail = r.json()["detail"][0]
+    assert detail["loc"] == ["body", "threshold_periods", 1, "start"]
+    assert "overlaps" in detail["msg"]
+
+
+def test_api_periods_hole_422():
+    p = staged_smoke_payload()
+    p["threshold_periods"][1]["start"] = "2026-01-01T00:31:00Z"  # 60s hole
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    detail = r.json()["detail"][0]
+    assert detail["loc"] == ["body", "threshold_periods", 1, "start"]
+    assert "coverage hole" in detail["msg"]
+
+
+def test_api_periods_overlap_error_uses_original_index_when_shuffled():
+    p = staged_smoke_payload()
+    # Submit second period first in the array; overlap is period[0] vs
+    # period[1] and must be reported at the later period's input index.
+    p["threshold_periods"] = [
+        {"start": "2026-01-01T00:30:00Z", "end": "2026-01-01T00:55:00Z",
+         "threshold_celsius": 6.0},
+        {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:31:00Z",
+         "threshold_celsius": 8.0},
+    ]
+    r = client.post("/api/cold-chain/exposure", json=p)
+    assert r.status_code == 422
+    detail = r.json()["detail"][0]
+    assert detail["loc"] == ["body", "threshold_periods", 1, "end"] or (
+        detail["loc"] == ["body", "threshold_periods", 0, "start"]
+        and "overlaps" in detail["msg"]
+    )
+
+
+def test_api_omitting_periods_keeps_legacy_semantics():
+    # No threshold_periods: response must be byte-for-byte the legacy one.
+    r = client.post("/api/cold-chain/exposure", json=smoke_payload())
+    assert r.status_code == 200
+    assert r.json() == {
+        "verdict": "fail",
+        "reasons": [
+            {
+                "code": "coverage_gap",
+                "gap_index": 0,
+                "message": (
+                    "coverage gap from 2026-01-01T00:25:00Z to "
+                    "2026-01-01T00:45:00Z (1200s) exceeds max_interval_seconds 600"
+                ),
+            },
+            {
+                "code": "single_excursion_exceeded",
+                "excursion_index": 0,
+                "duration_seconds": "1050",
+                "limit_seconds": "900",
+                "message": (
+                    "excursion 0 lasts 1050s, exceeding max_single_excursion_seconds 900"
+                ),
+            },
+        ],
+        "excursions": [
+            {
+                "start": "2026-01-01T00:05:00Z",
+                "end": "2026-01-01T00:22:30Z",
+                "duration_seconds": "1050",
+                "degree_minutes": "27.5",
+            }
+        ],
+        "total_degree_minutes": "27.5",
+        "coverage_gaps": [
+            {
+                "start": "2026-01-01T00:25:00Z",
+                "end": "2026-01-01T00:45:00Z",
+                "duration_seconds": "1200",
+            }
+        ],
+    }
 
 
 def test_healthz():

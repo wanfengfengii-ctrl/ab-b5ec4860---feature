@@ -7,6 +7,10 @@ Steps (each prints a clear banner; the process exit code reports the result):
      that contains BOTH a threshold crossing and a coverage gap, and assert
      the adjudication; also assert that shuffled input order and different
      decimal/timestamp representations yield an identical conclusion.
+  4. submit a second request over the SAME trajectory that additionally uses
+     per-period thresholds (threshold_periods) with a threshold switch, a
+     crossing and a coverage gap, and assert the continuous excursions,
+     degree-minute budget and locatable 422 semantics.
 
 Run with:  python -m verify.run
 Environment:
@@ -83,6 +87,30 @@ def representation_variant(payload: dict) -> dict:
     return variant
 
 
+def staged_smoke_payload() -> dict:
+    """Same trajectory as smoke_payload with per-period thresholds.
+
+    Adds a threshold SWITCH at 00:30 (loading limit 8 degC, stabilized
+    transport limit 6 degC) on top of the existing crossing (6->10 across 8)
+    and coverage gap (00:25 -> 00:45, 1200s > 600s).
+    """
+    p = smoke_payload()
+    p["max_single_excursion_seconds"] = 3600
+    p["threshold_periods"] = [
+        {
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-01T00:30:00Z",
+            "threshold_celsius": 8.0,
+        },
+        {
+            "start": "2026-01-01T00:30:00Z",
+            "end": "2026-01-01T00:55:00Z",
+            "threshold_celsius": 6.0,
+        },
+    ]
+    return p
+
+
 def wait_for_api(timeout_s: int = 90) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -98,11 +126,11 @@ def wait_for_api(timeout_s: int = 90) -> bool:
 
 def main() -> int:
     # 1. code tests ---------------------------------------------------------
-    step("1/3 unit & integration tests (pytest)")
+    step("1/4 unit & integration tests (pytest)")
     check("pytest", run_cmd([sys.executable, "-m", "pytest", "-q", "tests"]) == 0)
 
     # 2. application build --------------------------------------------------
-    step("2/3 application build check")
+    step("2/4 application build check")
     check(
         "byte-compile",
         run_cmd([sys.executable, "-m", "compileall", "-q", "app", "verify"]) == 0,
@@ -113,7 +141,7 @@ def main() -> int:
     )
 
     # 3. business smoke request ---------------------------------------------
-    step("3/3 business smoke request (threshold crossing + coverage gap)")
+    step("3/4 business smoke request (threshold crossing + coverage gap)")
     check("api healthy", wait_for_api(), f"no /healthz 200 from {API_BASE}")
 
     if not _failures:
@@ -185,11 +213,118 @@ def main() -> int:
         except requests.RequestException as exc:
             check("smoke request executed", False, str(exc))
 
+    # 4. per-period thresholds: switch + crossing + gap ---------------------
+    step("4/4 staged-threshold smoke request (switch + crossing + gap)")
+    if not _failures:
+        try:
+            sp = staged_smoke_payload()
+            rs = requests.post(API_BASE + "/api/cold-chain/exposure", json=sp, timeout=10)
+            check("staged status 200", rs.status_code == 200, f"got {rs.status_code}: {rs.text[:400]}")
+            sb = rs.json()
+
+            check("staged verdict is fail", sb.get("verdict") == "fail", json.dumps(sb)[:400])
+            check(
+                "staged two continuous excursions, no double/missing timing",
+                sb.get("excursions")
+                == [
+                    {
+                        "start": "2026-01-01T00:05:00Z",
+                        "end": "2026-01-01T00:22:30Z",
+                        "duration_seconds": "1050",
+                        "degree_minutes": "27.5",
+                    },
+                    {
+                        "start": "2026-01-01T00:45:00Z",
+                        "end": "2026-01-01T00:55:00Z",
+                        "duration_seconds": "600",
+                        "degree_minutes": "10",
+                    },
+                ],
+                json.dumps(sb.get("excursions")),
+            )
+            check(
+                "staged total degree-minutes 37.5 (period-aware budget)",
+                sb.get("total_degree_minutes") == "37.5",
+                str(sb.get("total_degree_minutes")),
+            )
+            scodes = {reason["code"] for reason in sb.get("reasons", [])}
+            check(
+                "staged reasons: gap + budget (stricter second period)",
+                scodes == {"coverage_gap", "degree_minute_budget_exceeded"},
+                f"codes={scodes}",
+            )
+
+            # Order invariance for the periods themselves.
+            shuffled = staged_smoke_payload()
+            shuffled["threshold_periods"] = list(reversed(shuffled["threshold_periods"]))
+            rsv = requests.post(
+                API_BASE + "/api/cold-chain/exposure", json=shuffled, timeout=10
+            )
+            check(
+                "staged period-order invariant",
+                rsv.status_code == 200 and rsv.json() == sb,
+                f"status={rsv.status_code} body={rsv.text[:400]}",
+            )
+
+            # Boundary semantics: the new period's threshold takes effect at
+            # the boundary; 9 degC vs 8 -> 9 thresholds closes the excursion
+            # exactly at 00:30 with no duplicated or missed exposure.
+            boundary = smoke_payload()
+            boundary["max_interval_seconds"] = 3600
+            boundary["max_single_excursion_seconds"] = 3600
+            boundary["readings"] = [
+                {"time": "2026-01-01T00:00:00Z", "celsius": 9.0},
+                {"time": "2026-01-01T00:30:00Z", "celsius": 9.0},
+                {"time": "2026-01-01T00:55:00Z", "celsius": 9.0},
+            ]
+            boundary["threshold_periods"] = [
+                {
+                    "start": "2026-01-01T00:00:00Z",
+                    "end": "2026-01-01T00:30:00Z",
+                    "threshold_celsius": 8.0,
+                },
+                {
+                    "start": "2026-01-01T00:30:00Z",
+                    "end": "2026-01-01T00:55:00Z",
+                    "threshold_celsius": 9.0,
+                },
+            ]
+            rb = requests.post(
+                API_BASE + "/api/cold-chain/exposure", json=boundary, timeout=10
+            )
+            check(
+                "threshold jump closes/opens excursion at boundary (30 deg-min)",
+                rb.status_code == 200
+                and rb.json().get("excursions")
+                == [
+                    {
+                        "start": "2026-01-01T00:00:00Z",
+                        "end": "2026-01-01T00:30:00Z",
+                        "duration_seconds": "1800",
+                        "degree_minutes": "30",
+                    }
+                ],
+                f"status={rb.status_code} body={rb.text[:300]}",
+            )
+
+            # Locatable 422: a coverage hole between periods.
+            badp = staged_smoke_payload()
+            badp["threshold_periods"][1]["start"] = "2026-01-01T00:31:00Z"
+            rh = requests.post(API_BASE + "/api/cold-chain/exposure", json=badp, timeout=10)
+            hole_ok = (
+                rh.status_code == 422
+                and rh.json()["detail"][0]["loc"]
+                == ["body", "threshold_periods", 1, "start"]
+            )
+            check("period coverage hole -> locatable 422", hole_ok, f"got {rh.status_code}: {rh.text[:300]}")
+        except requests.RequestException as exc:
+            check("staged smoke request executed", False, str(exc))
+
     step("summary")
     if _failures:
         print(f"VERIFY FAILED: {len(_failures)} check(s) failed: {', '.join(_failures)}", flush=True)
         return 1
-    print("VERIFY OK: tests, build and smoke request all passed", flush=True)
+    print("VERIFY OK: tests, build and smoke requests all passed", flush=True)
     return 0
 
 
