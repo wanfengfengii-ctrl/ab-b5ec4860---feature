@@ -1,0 +1,32 @@
+# Cold-chain thermal exposure adjudication service.
+#
+#   docker compose up --build api          # run the API
+#   API_PORT=9000 docker compose up api    # host port is configurable
+#   docker compose up --build --exit-code-from verify --abort-on-container-exit verify
+#                                          # one-shot verify: tests + build + smoke
+services:
+  api:
+    build: .
+    image: cold-chain-exposure:latest
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=2).status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  verify:
+    build: .
+    image: cold-chain-exposure:latest
+    command: ["python", "-m", "verify.run"]
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
